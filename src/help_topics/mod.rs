@@ -1,0 +1,159 @@
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+use std::sync::OnceLock;
+
+use homeboy::core::engine::text;
+use homeboy::core::extension::load_all_extensions;
+
+include!(concat!(env!("OUT_DIR"), "/generated_docs.rs"));
+
+fn docs_index() -> &'static HashMap<&'static str, &'static str> {
+    static DOCS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+
+    DOCS.get_or_init(|| GENERATED_DOCS.iter().copied().collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDoc {
+    pub content: String,
+}
+
+pub fn resolve(topic: &[String]) -> homeboy::core::Result<ResolvedDoc> {
+    let (_, key, _) = normalize_topic(topic);
+
+    // Try exact match first (existing behavior)
+    if let Some(content) = docs_index().get(key.as_str()).copied() {
+        return Ok(ResolvedDoc {
+            content: content.to_string(),
+        });
+    }
+
+    // Then check extension docs (existing behavior)
+    if let Some((content, _extension_id)) = load_extension_doc(&key) {
+        return Ok(ResolvedDoc { content });
+    }
+
+    // Try fallback prefixes for common shortcuts
+    let fallback_keys = vec![
+        format!("commands/{}", key),
+        format!("documentation/{}", key),
+        format!("{}/{}-index", key, key),
+    ];
+
+    for fallback_key in fallback_keys {
+        if let Some(content) = docs_index().get(fallback_key.as_str()).copied() {
+            return Ok(ResolvedDoc {
+                content: content.to_string(),
+            });
+        }
+
+        if let Some((content, _extension_id)) = load_extension_doc(&fallback_key) {
+            return Ok(ResolvedDoc { content });
+        }
+    }
+
+    Err(homeboy::core::Error::docs_topic_not_found(&key))
+}
+
+fn load_extension_doc(topic: &str) -> Option<(String, String)> {
+    for extension in load_all_extensions().unwrap_or_default() {
+        let Some(extension_path) = &extension.extension_path else {
+            continue;
+        };
+        let doc_file = Path::new(extension_path)
+            .join("docs")
+            .join(format!("{}.md", topic));
+        if let Ok(content) = std::fs::read_to_string(&doc_file) {
+            return Some((content, extension.id));
+        }
+    }
+    None
+}
+
+fn normalize_topic(topic: &[String]) -> (String, String, Vec<String>) {
+    if topic.is_empty() {
+        return (
+            "index".to_string(),
+            "index".to_string(),
+            vec!["index".to_string()],
+        );
+    }
+
+    let user_label = topic.join(" ");
+
+    let mut segments: Vec<String> = Vec::new();
+    for raw in topic {
+        for part in raw.split('/') {
+            let segment = text::normalize_doc_segment(part);
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return (
+            "unknown".to_string(),
+            "index".to_string(),
+            vec!["index".to_string()],
+        );
+    }
+
+    let key = segments.join("/");
+
+    if user_label.is_empty() {
+        return ("unknown".to_string(), key, segments);
+    }
+
+    (user_label, key, segments)
+}
+
+pub fn available_topics() -> Vec<String> {
+    let mut topics: BTreeSet<String> = GENERATED_DOCS
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .collect();
+
+    // Add extension docs (integrated namespace)
+    for extension in load_all_extensions().unwrap_or_default() {
+        if let Some(extension_path) = &extension.extension_path {
+            let docs_dir = Path::new(extension_path).join("docs");
+            if docs_dir.exists() {
+                collect_doc_topics(&docs_dir, "", &mut topics);
+            }
+        }
+    }
+
+    topics.into_iter().collect()
+}
+
+fn collect_doc_topics(dir: &Path, prefix: &str, topics: &mut BTreeSet<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                let name = name.to_string_lossy();
+                let new_prefix = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", prefix, name)
+                };
+                collect_doc_topics(&path, &new_prefix, topics);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                let Some(stem) = path.file_stem() else {
+                    continue;
+                };
+                let stem = stem.to_string_lossy();
+                let topic = if prefix.is_empty() {
+                    stem.to_string()
+                } else {
+                    format!("{}/{}", prefix, stem)
+                };
+                topics.insert(topic);
+            }
+        }
+    }
+}

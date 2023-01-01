@@ -1,0 +1,31 @@
+{
+  "success": false,
+  "data": {
+    "passed": false,
+    "test_counts": {
+      "total": 12,
+      "passed": 10,
+      "failed": 2,
+      "skipped": 0
+    },
+    "findings": [
+      {
+        "tool": "test",
+        "message": "expected widget output",
+        "file": "tests/widget_test.rs",
+        "line": 42,
+        "metadata": {
+          "test_name": "test_widget_renders"
+        }
+      },
+      {
+        "tool": "test",
+        "message": "empty state missing",
+        "file": "tests/widget_test.rs",
+        "metadata": {
+          "test_name": "test_widget_handles_empty_state"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,731 @@
+# Continuous release pipeline for Homeboy.
+#
+# Triggers on push to main (and manual dispatch). Checks for releasable
+# conventional commits since the last tag. If found:
+#   1. Quality gate (audit, lint, test)
+#   2. Version bump + changelog generation from conventional commits
+#   3. Cross-platform binary builds via cargo-dist
+#   4. Publish to GitHub Releases, crates.io, and Homebrew
+#   5. Auto-refactor direct commits (post-release, never opens PRs)
+#
+# No human input needed — version is computed from commit types:
+#   fix: → patch, feat: → minor, BREAKING CHANGE → major
+#   chore:/ci:/docs:/test: → no release
+
+name: Release
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Preview the release without making changes'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Existing tag to publish/recover without preparing a new release'
+        type: string
+        default: ''
+      release_blocking_commands:
+        description: 'Comma-separated quality commands that may block release preparation'
+        type: string
+        default: 'lint,test'
+
+env:
+  RELEASE_BLOCKING_COMMANDS: ${{ inputs.release_blocking_commands || 'lint,test' }}
+
+# Only one release pipeline at a time. If a push arrives while a release
+# is already running, it queues (never cancels). The queued run starts
+# after the first finishes and its check job exits in seconds because
+# HEAD is already tagged — zero wasted work.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Step 1: Check for releasable commits ──
+  # Fast exit if nothing to release (e.g. chore-only commits).
+  check:
+    name: Check for releasable commits
+    runs-on: ubuntu-latest
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      bump-type: ${{ steps.check.outputs.release-bump-type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Dry-run release check
+        id: release-check
+        if: inputs.release_tag == ''
+        uses: Extra-Chill/homeboy-action@v2
+        with:
+          commands: release
+          expected-commands: audit,lint,test
+          release-dry-run: 'true'
+
+      - name: Validate existing release tag
+        id: recovery
+        if: inputs.release_tag != ''
+        run: |
+          TAG="${{ inputs.release_tag }}"
+
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Release tag ${TAG} does not exist"
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag ${TAG} must look like v1.2.3"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          echo "release-version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release-tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release-bump-type=recovery" >> "$GITHUB_OUTPUT"
+          echo "::notice::Recovering publish pipeline for existing tag ${TAG}"
+
+      - name: Decide whether to release
+        id: check
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          RECOVERY_TAG="${{ steps.recovery.outputs.release-tag }}"
+          RELEASE_VERSION="${{ steps.recovery.outputs.release-version || steps.release-check.outputs.release-version }}"
+          BUMP_TYPE="${{ steps.recovery.outputs.release-bump-type || steps.release-check.outputs.release-bump-type }}"
+
+          if [ -n "${RECOVERY_TAG}" ]; then
+            echo "should-release=true" >> "$GITHUB_OUTPUT"
+            echo "release-bump-type=${BUMP_TYPE}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release recovery will publish ${RECOVERY_TAG}"
+          elif [ -z "${RELEASE_VERSION}" ]; then
+            echo "should-release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No releasable commits at HEAD ${HEAD_SHA:0:8}"
+          else
+            echo "should-release=true" >> "$GITHUB_OUTPUT"
+            echo "release-bump-type=${BUMP_TYPE}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release dry-run predicts v${RELEASE_VERSION} (${BUMP_TYPE})"
+          fi
+
+  # ── Step 2: Build once ──
+  # Compile homeboy from source once and share the binary with all
+  # quality gate jobs. Eliminates 3× redundant cargo builds.
+  gate-build:
+    name: Build
+    needs: check
+    if: needs.check.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-gate-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-gate-
+
+      - name: Build homeboy
+        run: cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: homeboy-binary
+          path: target/release/homeboy
+          retention-days: 1
+
+  # ── Step 3: Quality checks (parallel read-only checks + advisory repair) ──
+  # Release preparation is gated by release-quality-policy, not by raw job
+  # failures. Commands opt in to release blocking through RELEASE_BLOCKING_COMMANDS
+  # (default: lint,test). Audit still runs and files issues, but stale/full-tree
+  # audit debt does not block releases unless audit is explicitly listed.
+  gate-audit:
+    name: Audit
+    needs:
+      - check
+      - gate-build
+    if: needs.check.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      audit-result: ${{ steps.audit.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download homeboy binary
+        uses: actions/download-artifact@v4
+        with:
+          name: homeboy-binary
+          path: .homeboy-bin
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HOMEBOY_APP_ID }}
+          private-key: ${{ secrets.HOMEBOY_APP_PRIVATE_KEY }}
+
+      - name: Run advisory audit
+        id: audit
+        uses: Extra-Chill/homeboy-action@v2
+        continue-on-error: true
+        with:
+          binary-path: .homeboy-bin/homeboy
+          commands: audit
+          expected-commands: audit,lint,test
+          args: ${{ github.event.before && format('--changed-since {0}', github.event.before) || '' }}
+          autofix: 'false'
+          app-token: ${{ steps.app-token.outputs.token || '' }}
+
+  gate-lint:
+    name: Lint
+    needs:
+      - check
+      - gate-build
+    if: needs.check.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download homeboy binary
+        uses: actions/download-artifact@v4
+        with:
+          name: homeboy-binary
+          path: .homeboy-bin
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HOMEBOY_APP_ID }}
+          private-key: ${{ secrets.HOMEBOY_APP_PRIVATE_KEY }}
+
+      - uses: Extra-Chill/homeboy-action@v2
+        with:
+          binary-path: .homeboy-bin/homeboy
+          commands: lint
+          expected-commands: audit,lint,test
+          autofix: 'false'
+          app-token: ${{ steps.app-token.outputs.token || '' }}
+
+  gate-test:
+    name: Test
+    needs:
+      - check
+      - gate-build
+    if: needs.check.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download homeboy binary
+        uses: actions/download-artifact@v4
+        with:
+          name: homeboy-binary
+          path: .homeboy-bin
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HOMEBOY_APP_ID }}
+          private-key: ${{ secrets.HOMEBOY_APP_PRIVATE_KEY }}
+
+      - uses: Extra-Chill/homeboy-action@v2
+        env:
+          RELEASE_BLOCKING_COMMANDS: ${{ env.RELEASE_BLOCKING_COMMANDS }}
+        with:
+          binary-path: .homeboy-bin/homeboy
+          commands: test
+          expected-commands: audit,lint,test
+          autofix: 'false'
+          app-token: ${{ steps.app-token.outputs.token || '' }}
+
+  gate-refactor:
+    name: Auto-refactor
+    needs:
+      - check
+      - gate-build
+      - gate-lint
+      - gate-test
+    if: ${{ always() && inputs.release_tag == '' && needs.check.outputs.should-release == 'true' && needs.gate-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download homeboy binary
+        uses: actions/download-artifact@v4
+        with:
+          name: homeboy-binary
+          path: .homeboy-bin
+
+      - name: Prepare binary
+        run: chmod +x .homeboy-bin/homeboy
+
+      # Rust toolchain needed for cargo fmt (called by lint fixer in autofix)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HOMEBOY_APP_ID }}
+          private-key: ${{ secrets.HOMEBOY_APP_PRIVATE_KEY }}
+
+      # In Homeboy Action, autofix-open-pr gates the non-PR repair transaction.
+      # Only release-blocking commands are repaired in the release path. Audit
+      # remains tracked by gate-audit unless it is explicitly added to
+      # RELEASE_BLOCKING_COMMANDS.
+      - name: Run autofix via homeboy-action
+        uses: Extra-Chill/homeboy-action@v2
+        continue-on-error: true
+        with:
+          binary-path: .homeboy-bin/homeboy
+          commands: ${{ env.RELEASE_BLOCKING_COMMANDS }}
+          expected-commands: audit,lint,test
+          autofix: 'true'
+          autofix-mode: always
+          autofix-open-pr: 'true'
+          app-token: ${{ steps.app-token.outputs.token }}
+
+  release-quality-policy:
+    name: Release Quality Policy
+    needs:
+      - check
+      - gate-build
+      - gate-audit
+      - gate-lint
+      - gate-test
+      - gate-refactor
+    if: ${{ always() && needs.check.outputs.should-release == 'true' && needs.gate-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce release-blocking commands
+        env:
+          BLOCKING_COMMANDS: ${{ env.RELEASE_BLOCKING_COMMANDS }}
+          AUDIT_RESULT: ${{ needs.gate-audit.outputs.audit-result || needs.gate-audit.result }}
+          LINT_RESULT: ${{ needs.gate-lint.result }}
+          TEST_RESULT: ${{ needs.gate-test.result }}
+          REFACTOR_RESULT: ${{ needs.gate-refactor.result }}
+        run: |
+          set -euo pipefail
+
+          normalized="$(printf '%s' "${BLOCKING_COMMANDS}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          blocking=",${normalized},"
+          failed=0
+
+          check_command() {
+            local command="$1"
+            local result="$2"
+
+            if [[ "${blocking}" == *",${command},"* ]]; then
+              if [ "${result}" = "success" ]; then
+                echo "::notice::Release-blocking command ${command} passed"
+              else
+                echo "::error::Release-blocking command ${command} finished with result: ${result}"
+                failed=1
+              fi
+            else
+              echo "::notice::Command ${command} is tracked but not release-blocking (result: ${result})"
+            fi
+          }
+
+          check_command audit "${AUDIT_RESULT}"
+          check_command lint "${LINT_RESULT}"
+          check_command test "${TEST_RESULT}"
+
+          if [ "${REFACTOR_RESULT}" != "success" ]; then
+            echo "::notice::Advisory auto-refactor finished with result: ${REFACTOR_RESULT}"
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+
+  # ── Step 4: Version bump + changelog + tag ──
+  prepare:
+    name: Prepare Release
+    needs:
+      - check
+      - gate-build
+      - release-quality-policy
+    if: ${{ always() && needs.check.outputs.should-release == 'true' && needs.gate-build.result == 'success' && (inputs.release_tag != '' || needs.release-quality-policy.result == 'success') }}
+    runs-on: ubuntu-latest
+    outputs:
+      release-version: ${{ steps.recovery.outputs.release-version || steps.release.outputs.release-version }}
+      release-tag: ${{ steps.recovery.outputs.release-tag || steps.release.outputs.release-tag }}
+      prepared: ${{ steps.recovery.outputs.prepared || steps.prepared.outputs.prepared }}
+      released: ${{ steps.recovery.outputs.released || steps.release.outputs.released }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.HOMEBOY_APP_ID }}
+          private-key: ${{ secrets.HOMEBOY_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      # Rust toolchain needed so run-release.sh can regenerate Cargo.lock
+      # after bumping Cargo.toml version
+      - name: Install Rust toolchain
+        if: inputs.release_tag == ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Extra-Chill/homeboy-action@v2
+        id: release
+        if: inputs.release_tag == ''
+        with:
+          source: '.'
+          commands: release
+          expected-commands: audit,lint,test
+          release-dry-run: ${{ inputs.dry-run || 'false' }}
+          release-skip-publish: 'true'
+          release-skip-github-release: 'true'
+          app-token: ${{ steps.app-token.outputs.token || '' }}
+
+      - name: Mark prepared release for downstream publish
+        id: prepared
+        if: inputs.release_tag == '' && steps.release.outputs.release-tag != ''
+        run: |
+          echo "prepared=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Prepared ${{ steps.release.outputs.release-tag }}; downstream jobs will publish it in this run"
+
+      - name: Use existing release tag
+        id: recovery
+        if: inputs.release_tag != ''
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          VERSION="${TAG#v}"
+
+          echo "release-version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release-tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prepared=true" >> "$GITHUB_OUTPUT"
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Skipping release preparation; downstream jobs will publish existing tag ${TAG}"
+
+  # ── Step 4: Build cross-platform binaries ──
+  plan:
+    name: Plan Build Matrix
+    needs: prepare
+    if: needs.prepare.outputs.prepared == 'true' && needs.prepare.outputs.release-tag != ''
+    runs-on: ubuntu-22.04
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      tag-flag: ${{ format('--tag={0}', needs.prepare.outputs.release-tag) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+
+      - name: Cache dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/dist
+
+      - id: plan
+        run: |
+          dist host --steps=create --tag=${{ needs.prepare.outputs.release-tag }} --output-format=json > plan-dist-manifest.json
+          echo "dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist-manifest.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
+
+  build-local-artifacts:
+    name: build (${{ join(matrix.targets, ', ') }})
+    needs:
+      - prepare
+      - plan
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    steps:
+      - name: enable windows longpaths
+        run: |
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: |
+          ${{ matrix.packages_install }}
+
+      - name: Build artifacts
+        run: |
+          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo "dist ran successfully"
+
+      - id: cargo-dist
+        name: Post-build
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  build-global-artifacts:
+    needs:
+      - prepare
+      - plan
+      - build-local-artifacts
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cached dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - id: cargo-dist
+        shell: bash
+        run: |
+          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          echo "dist ran successfully"
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  # ── Step 5: Publish ──
+  host:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    runs-on: ubuntu-22.04
+    outputs:
+      val: ${{ steps.host.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cached dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - id: host
+        shell: bash
+        run: |
+          dist host --tag=${{ needs.prepare.outputs.release-tag }} --steps=upload --output-format=json > dist-manifest.json
+          echo "artifacts uploaded successfully"
+          cat dist-manifest.json
+          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist-manifest.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-dist-manifest
+          path: dist-manifest.json
+
+      - name: Download GitHub Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Cleanup
+        run: |
+          rm -f artifacts/*-dist-manifest.json
+
+      - name: Finish Homeboy release pipeline at tag
+        run: |
+          cargo build --release --bin homeboy
+          ./target/release/homeboy extension install-for-component --path . --source https://github.com/Extra-Chill/homeboy-extensions
+          ./target/release/homeboy release homeboy --head --from-artifacts artifacts --skip-checks
+
+  publish-homebrew-formula:
+    needs:
+      - prepare
+      - plan
+      - host
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ needs.plan.outputs.val }}
+      GITHUB_USER: "axo bot"
+      GITHUB_EMAIL: "admin+bot@axo.dev"
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          repository: "Extra-Chill/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Fetch homebrew formulae
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+
+      - name: Commit formula files
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name=$(echo "$filename" | sed "s/\.rb$//")
+            version=$(echo "$release" | jq .app_version --raw-output)
+
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+            brew update
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+
+            git add "Formula/${filename}"
+            git commit -m "${name} ${version}"
+          done
+          git push
+
+  announce:
+    needs:
+      - plan
+      - host
+      - publish-homebrew-formula
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive

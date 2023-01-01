@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+dist-manifest.json
+.homeboy-bin/
+/artifacts/
+
+# Dependencies
+/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# CI artifacts
+.release-last-failed
+/homeboy-observations/
+
+# Keep Cargo.lock for reproducible builds
+.phpunit.result.cache

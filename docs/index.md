@@ -1,0 +1,115 @@
+# Homeboy CLI documentation
+
+This directory contains the markdown docs embedded into the `homeboy` binary and displayed via `homeboy docs`.
+
+Homeboy is headless automation for agentic software engineering workflows. It
+provides a component-aware CLI, stable JSON output, persisted evidence, and
+runner/daemon surfaces for local developers, CI, scheduled jobs, and coding
+agents.
+
+Core is domain-agnostic. Homeboy owns orchestration, configuration, scope
+resolution, output contracts, persisted runs, runners, and generic workflow
+primitives. Domain-specific behavior belongs in extensions such as the shared
+[homeboy-extensions](https://github.com/Extra-Chill/homeboy-extensions)
+repository.
+
+## Code Factory
+
+- [Code Factory](code-factory.md) - Automated code maintenance: lint+fix → test+fix → audit+fix → release → deploy
+
+## Operator Guides
+
+- [Controller to runner reverse-runner setup](operators/controller-runner-reverse-runner.md) - Setup, smoke evidence, and troubleshooting for the gated reverse-runner path tracked by #2993 and #2950
+
+## CLI
+
+- Root command + global flags: [Root command](cli/homeboy-root-command.md)
+- Full built-in command list: [Commands index](commands/commands-index.md)
+- Code audit (convention drift, structural analysis): [audit](commands/audit.md), [audit-baseline](commands/audit-baseline.md)
+- Changes summary: [changes](commands/changes.md)
+- Reproducible local dev environments: [rig](commands/rig.md)
+- Rig spec JSON schema: [rig-spec](commands/rig-spec.md)
+- Combined-fixes branch specs: [stack](commands/stack.md)
+- Performance benchmarks with baseline ratchet: [bench](commands/bench.md)
+- API authentication scoped per project: [auth](commands/auth.md)
+- JSON output envelope: [JSON output contract](architecture/output-system.md)
+- CI artifact payload for PR review agents: [CI result JSON contract](architecture/ci-results-contract.md)
+- Embedded docs behavior: [Embedded docs topic resolution](architecture/embedded-docs-topic-resolution.md)
+- Changelog content: [Changelog](changelog.md)
+- Template variables: [Template variables reference](templates.md)
+
+## Schemas
+
+JSON configuration schemas for components, projects, servers, fleets, and extensions:
+
+- [Component schema](schemas/component-schema.md) - Buildable, testable, reviewable units
+- [Project schema](schemas/project-schema.md) - Deployable environments
+- [Server schema](schemas/server-schema.md) - SSH connection settings
+- [Fleet schema](schemas/fleet-schema.md) - Named groups of projects
+- [Extension manifest schema](schemas/extension-manifest-schema.md) - Extension configuration
+
+## Architecture
+
+Internal system architecture and internals:
+
+- [Architecture overview](developer-guide/architecture-overview.md) - High-level system design
+- [API client system](architecture/api-client.md) - HTTP client and authentication
+- [Keychain/secrets management](architecture/keychain-secrets.md) - Secure credential storage
+- [SSH key management](architecture/ssh-key-management.md) - SSH key handling
+- [Release pipeline system](architecture/release-pipeline.md) - Local release orchestration
+- [Planned change execution](architecture/planned-change-execution.md) - Core lifecycle vocabulary for plan, execute, artifact, approve, apply, and publish
+- [Apply and publish contract](architecture/apply-publish-contract.md) - Local apply boundary and post-apply publish semantics
+- [Agent task executor adapter](architecture/agent-task-executor-adapter.md) - Provider-neutral adapter boundary for runtime providers, CLI sessions, and runner backends
+- [Provider fanout boundary](architecture/provider-fanout-boundary.md) - Ownership contract for durable orchestration versus provider runtime fanout
+- [Preview metadata](architecture/preview-metadata.md) - Generic preview URL, hold, lifecycle, runtime, and cleanup metadata preserved across runs
+- [Scope model](architecture/scope-model.md) - Components, targets/projects, rigs, fleets, workspace, and paths
+- [Execution context](architecture/execution-context.md) - Runtime context for extensions
+- [Rig matrix axis composition](architecture/rig-matrix-axis-composition.md) - Design for derived rig variants
+- [Embedded docs](architecture/embedded-docs-topic-resolution.md) - Documentation system internals
+
+## Developer Guide
+
+Guides for contributing to Homeboy:
+
+- [Architecture overview](developer-guide/architecture-overview.md) - System architecture
+- [Config directory structure](developer-guide/config-directory.md) - File organization
+- [Error handling patterns](developer-guide/error-handling.md) - Error recovery strategies
+
+## Documentation Management
+
+Homeboy provides embedded docs and AI-assisted documentation mapping:
+
+- `homeboy docs <topic>` - Display embedded documentation topics
+- `homeboy docs map <component>` - Generate machine-optimized codebase map for AI context
+- `homeboy docs list` - List embedded documentation topics
+- `homeboy docs documentation/index` - Documentation philosophy and principles
+- `homeboy docs documentation/alignment` - Instructions for maintaining existing docs
+- `homeboy docs documentation/generation` - Instructions for generating new docs
+- `homeboy docs documentation/structure` - File organization standards
+
+## Configuration
+
+Configuration and state live under universal directory `~/.config/homeboy/` (all platforms).
+
+- macOS: `~/.config/homeboy/`
+- Linux: `~/.config/homeboy/`
+- Windows: `%APPDATA%\homeboy\`
+
+Common paths:
+
+- ~/.config/homeboy/projects/
+- ~/.config/homeboy/servers/
+- ~/.config/homeboy/components/
+- ~/.config/homeboy/fleets/
+- ~/.config/homeboy/extensions/
+- ~/.config/homeboy/keys/
+- ~/.config/homeboy/backups/
+
+Notes:
+
+- Embedded CLI docs ship inside the binary (see [Embedded docs topic resolution](architecture/embedded-docs-topic-resolution.md)).
+- Extension docs load from each installed extension's `docs/` folder under the Homeboy config root: `~/.config/homeboy/extensions/<extension_id>/docs/` (same topic-key rules as core docs).
+- The CLI does not write documentation into `~/.config/homeboy/docs/`.
+
+
+- [Cross-Compilation Guide](cross-compilation.md) - Platform requirements for native binaries

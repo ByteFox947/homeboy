@@ -1,0 +1,214 @@
+//! JSON output envelopes for rig commands.
+//!
+//! Split from the command handler to keep item counts manageable and so
+//! consumers can import a single `RigCommandOutput` enum.
+
+use serde::Serialize;
+
+use crate::commands::runs::RunsOutput;
+use homeboy::core::rig::{self, RigResourcesSpec, RigSpec};
+
+/// Tagged union of every rig command's output.
+#[derive(Serialize)]
+#[serde(tag = "variant", content = "payload", rename_all = "snake_case")]
+pub enum RigCommandOutput {
+    List(RigListOutput),
+    Show(RigShowOutput),
+    Up(RigUpOutput),
+    Check(RigCheckOutput),
+    Down(RigDownOutput),
+    Repair(RigRepairOutput),
+    Sync(RigSyncOutput),
+    Status(RigStatusOutput),
+    Install(RigInstallOutput),
+    Update(RigUpdateOutput),
+    Sources(RigSourcesOutput),
+    App(RigAppOutput),
+    Runs(RunsOutput),
+}
+
+#[derive(Serialize)]
+pub struct RigListOutput {
+    pub command: &'static str,
+    pub rigs: Vec<RigSummary>,
+}
+
+#[derive(Serialize)]
+pub struct RigSummary {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_id: Option<String>,
+    pub description: String,
+    pub component_count: usize,
+    pub service_count: usize,
+    pub pipelines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<RigSourceSummary>,
+}
+
+#[derive(Serialize)]
+pub struct RigSourceSummary {
+    pub source: String,
+    pub package_path: String,
+    pub rig_path: String,
+    pub linked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RigShowOutput {
+    pub command: &'static str,
+    pub rig: RigSpec,
+    #[serde(skip_serializing_if = "RigResourcesSpec::is_empty")]
+    pub resources: RigResourcesSpec,
+}
+
+#[derive(Serialize)]
+pub struct RigUpOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::UpReport,
+}
+
+#[derive(Serialize)]
+pub struct RigCheckOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::CheckReport,
+}
+
+#[derive(Serialize)]
+pub struct RigDownOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::DownReport,
+}
+
+#[derive(Serialize)]
+pub struct RigRepairOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::RepairReport,
+}
+
+#[derive(Serialize)]
+pub struct RigSyncOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::RigStackSyncReport,
+}
+
+#[derive(Serialize)]
+pub struct RigStatusOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::RigStatusReport,
+}
+
+#[derive(Serialize)]
+pub struct RigInstallOutput {
+    pub command: &'static str,
+    pub source: String,
+    pub package_path: String,
+    pub linked: bool,
+    pub installed: Vec<RigInstalledSummary>,
+    pub installed_stacks: Vec<RigInstalledStackSummary>,
+}
+
+#[derive(Serialize)]
+pub struct RigInstalledSummary {
+    pub id: String,
+    pub description: String,
+    pub path: String,
+    pub spec_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RigInstalledStackSummary {
+    pub id: String,
+    pub description: String,
+    pub path: String,
+    pub spec_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RigUpdateOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::RigSourceUpdateResult,
+}
+
+#[derive(Serialize)]
+pub struct RigSourcesOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: RigSourcesReport,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "variant", content = "payload", rename_all = "snake_case")]
+pub enum RigSourcesReport {
+    List(rig::RigSourceListResult),
+    Remove(rig::RigSourceRemoveResult),
+    Refresh(rig::RigSourceUpdateResult),
+}
+
+#[derive(Serialize)]
+pub struct RigAppOutput {
+    pub command: &'static str,
+    #[serde(flatten)]
+    pub report: rig::AppLauncherReport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rig_show_output_includes_expanded_resources() {
+        let output = RigShowOutput {
+            command: "rig.show",
+            rig: RigSpec {
+                id: "studio-bfb".to_string(),
+                description: String::new(),
+                components: Default::default(),
+                services: Default::default(),
+                symlinks: Vec::new(),
+                shared_paths: Vec::new(),
+                resources: RigResourcesSpec {
+                    paths: vec!["~/Developer/studio".to_string()],
+                    ..Default::default()
+                },
+                pipeline: Default::default(),
+                bench: None,
+                bench_workloads: Default::default(),
+                trace_workloads: Default::default(),
+                trace_workload_defaults: Default::default(),
+                trace_variants: Default::default(),
+                trace_profiles: Default::default(),
+                trace_experiments: Default::default(),
+                trace_guardrails: Default::default(),
+                bench_profiles: Default::default(),
+                app_launcher: None,
+            },
+            resources: RigResourcesSpec {
+                exclusive: vec!["studio-runtime".to_string()],
+                paths: vec!["/Users/chubes/Developer/studio".to_string()],
+                ports: vec![9724],
+                process_patterns: vec!["wordpress-server-child.mjs".to_string()],
+            },
+        };
+
+        let json = serde_json::to_string(&output).expect("serialize");
+        assert!(json.contains("\"command\":\"rig.show\""));
+        assert!(json.contains("\"resources\""));
+        assert!(json.contains("/Users/chubes/Developer/studio"));
+        assert!(json.contains("studio-runtime"));
+        assert!(json.contains("wordpress-server-child.mjs"));
+    }
+}

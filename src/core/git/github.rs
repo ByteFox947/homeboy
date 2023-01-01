@@ -1,0 +1,1054 @@
+//! Component-aware GitHub primitives: issue and PR CRUD via the `gh` CLI.
+//!
+//! Shells out to `gh` (no new deps), mirroring the existing pattern used by
+//! `core/release/executor::run_github_release`. All operations are scoped to a
+//! component ID — the component's `remote_url` (or `git remote get-url origin`
+//! fallback) resolves the GitHub owner/repo automatically.
+//!
+//! # Why this lives in `core/git`
+//!
+//! These operations are component-scoped git-graph operations, same shape as
+//! `git commit`, `git push`, `git tag`. Grouping them under `git` keeps the
+//! CLI surface coherent (`homeboy git issue create`, `homeboy git pr create`)
+//! and reuses the existing `resolve_target` component → path resolution.
+//!
+//! # Error model
+//!
+//! When `gh` is missing, not authenticated, or fails, these functions return
+//! a structured error with recovery hints. Callers get a real failure instead
+//! of a silent skip — different from `run_github_release`, which soft-fails
+//! because the tag is already pushed by that point.
+
+use std::path::Path;
+use std::process::Command;
+
+use crate::core::component;
+use crate::core::deploy::release_download::{detect_remote_url, parse_github_url, GitHubRepo};
+use crate::core::error::{Error, Result};
+
+pub use super::github_types::{
+    GithubFindItem, GithubFindOutput, GithubIssueOutput, GithubPrOutput, GithubPrView,
+    IssueCloseOptions, IssueCloseReason, IssueCommentOptions, IssueCreateOptions, IssueEditOptions,
+    IssueFindOptions, IssueState, PrCreateOptions, PrEditOptions, PrFindOptions, PrMergeOptions,
+    PrState,
+};
+use super::resolve_target;
+
+// ---------------------------------------------------------------------------
+// Public API — issue
+// ---------------------------------------------------------------------------
+
+/// Create a new issue on the component's GitHub repository.
+pub fn issue_create(
+    component_id: Option<&str>,
+    options: IssueCreateOptions,
+) -> Result<GithubIssueOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    if options.title.trim().is_empty() {
+        return Err(Error::validation_invalid_argument(
+            "title",
+            "Issue title is required",
+            None,
+            None,
+        ));
+    }
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "issue".into(),
+        "create".into(),
+        "-R".into(),
+        repo_flag.clone(),
+        "--title".into(),
+        options.title.clone(),
+        "--body".into(),
+        options.body.clone(),
+    ];
+    for label in &options.labels {
+        args.push("--label".into());
+        args.push(label.clone());
+    }
+
+    let output = run_gh(&args)?;
+    let url = output.trim().to_string();
+    let number = parse_issue_number_from_url(&url);
+
+    Ok(GithubIssueOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "issue.create".to_string(),
+        success: true,
+        number,
+        url: Some(url),
+        title: Some(options.title),
+        state: Some("open".to_string()),
+    })
+}
+
+/// Post a comment on an existing issue.
+pub fn issue_comment(
+    component_id: Option<&str>,
+    options: IssueCommentOptions,
+) -> Result<GithubIssueOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let args: Vec<String> = vec![
+        "issue".into(),
+        "comment".into(),
+        options.number.to_string(),
+        "-R".into(),
+        repo_flag,
+        "--body".into(),
+        options.body.clone(),
+    ];
+
+    let output = run_gh(&args)?;
+    Ok(GithubIssueOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "issue.comment".to_string(),
+        success: true,
+        number: Some(options.number),
+        url: Some(output.trim().to_string()),
+        title: None,
+        state: None,
+    })
+}
+
+/// Close an existing issue with a typed reason.
+///
+/// `gh issue close --reason` accepts `completed | not planned | duplicate`.
+/// We expose the two semantically-meaningful values via [`IssueCloseReason`];
+/// `duplicate` is a special-case of "not planned" and not modeled here. Use
+/// [`IssueCloseOptions::comment`] to leave a closing comment in the same
+/// invocation (mirrors `gh issue close --comment`).
+pub fn issue_close(
+    component_id: Option<&str>,
+    options: IssueCloseOptions,
+) -> Result<GithubIssueOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "issue".into(),
+        "close".into(),
+        options.number.to_string(),
+        "-R".into(),
+        repo_flag,
+        "--reason".into(),
+        options.reason.as_gh_flag().to_string(),
+    ];
+    if let Some(comment) = &options.comment {
+        args.push("--comment".into());
+        args.push(comment.clone());
+    }
+
+    let _ = run_gh(&args)?;
+    Ok(GithubIssueOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "issue.close".to_string(),
+        success: true,
+        number: Some(options.number),
+        url: None,
+        title: None,
+        state: Some("closed".to_string()),
+    })
+}
+
+/// Edit an existing issue's title, body, or labels.
+///
+/// At least one of `title`, `body`, `add_labels`, or `remove_labels` must be
+/// provided. Mirrors `gh issue edit <n> [--title ...] [--body ...]
+/// [--add-label ...] [--remove-label ...]`. Used by `homeboy issues reconcile`
+/// to refresh the body of existing issues (open OR closed) so the latest
+/// finding count and run link stay visible without duplicating the issue.
+pub fn issue_edit(
+    component_id: Option<&str>,
+    options: IssueEditOptions,
+) -> Result<GithubIssueOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    if options.title.is_none()
+        && options.body.is_none()
+        && options.add_labels.is_empty()
+        && options.remove_labels.is_empty()
+    {
+        return Err(Error::validation_invalid_argument(
+            "title/body/labels",
+            "At least one of --title, --body, --add-label, or --remove-label must be provided",
+            None,
+            None,
+        ));
+    }
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "issue".into(),
+        "edit".into(),
+        options.number.to_string(),
+        "-R".into(),
+        repo_flag,
+    ];
+    if let Some(title) = &options.title {
+        args.push("--title".into());
+        args.push(title.clone());
+    }
+    if let Some(body) = &options.body {
+        args.push("--body".into());
+        args.push(body.clone());
+    }
+    for label in &options.add_labels {
+        args.push("--add-label".into());
+        args.push(label.clone());
+    }
+    for label in &options.remove_labels {
+        args.push("--remove-label".into());
+        args.push(label.clone());
+    }
+
+    let output = run_gh(&args)?;
+    Ok(GithubIssueOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "issue.edit".to_string(),
+        success: true,
+        number: Some(options.number),
+        url: Some(output.trim().to_string()),
+        title: options.title,
+        state: None,
+    })
+}
+
+/// Find issues matching the given filter. Useful for dedup before creating.
+///
+/// Uses `gh issue list --json number,title,body,url,state,stateReason,closedAt,labels`
+/// and filters locally (title and label conjunctions are simpler to enforce
+/// client-side than via the gh search syntax).
+pub fn issue_find(
+    component_id: Option<&str>,
+    options: IssueFindOptions,
+) -> Result<GithubFindOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let limit = if options.limit == 0 {
+        30
+    } else {
+        options.limit
+    };
+    let mut args: Vec<String> = vec![
+        "issue".into(),
+        "list".into(),
+        "-R".into(),
+        repo_flag,
+        "--state".into(),
+        options.state.as_gh_flag().to_string(),
+        "--limit".into(),
+        limit.to_string(),
+        "--json".into(),
+        "number,title,body,url,state,stateReason,closedAt,labels".into(),
+    ];
+    // Pass labels through gh to narrow the server-side result set; we still
+    // enforce the exact label-set conjunction locally in case gh changes the
+    // semantics of --label (currently: all-of).
+    for label in &options.labels {
+        args.push("--label".into());
+        args.push(label.clone());
+    }
+
+    let raw = run_gh(&args)?;
+    let items = parse_issue_list_json(&raw, &options)?;
+
+    Ok(GithubFindOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "issue.find".to_string(),
+        success: true,
+        items,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Public API — pull request
+// ---------------------------------------------------------------------------
+
+/// Open a new pull request.
+pub fn pr_create(component_id: Option<&str>, options: PrCreateOptions) -> Result<GithubPrOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    if options.title.trim().is_empty() {
+        return Err(Error::validation_invalid_argument(
+            "title",
+            "PR title is required",
+            None,
+            None,
+        ));
+    }
+    if options.base.trim().is_empty() || options.head.trim().is_empty() {
+        return Err(Error::validation_invalid_argument(
+            "base/head",
+            "PR base and head branches are required",
+            None,
+            None,
+        ));
+    }
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "create".into(),
+        "-R".into(),
+        repo_flag.clone(),
+        "--base".into(),
+        options.base.clone(),
+        "--head".into(),
+        options.head.clone(),
+        "--title".into(),
+        options.title.clone(),
+        "--body".into(),
+        options.body.clone(),
+    ];
+    if options.draft {
+        args.push("--draft".into());
+    }
+
+    let output = run_gh(&args)?;
+    let url = output.trim().to_string();
+    let number = parse_issue_number_from_url(&url);
+
+    Ok(GithubPrOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "pr.create".to_string(),
+        success: true,
+        number,
+        url: Some(url),
+        title: Some(options.title),
+        state: Some("open".to_string()),
+        base: Some(options.base),
+        head: Some(options.head),
+        ..Default::default()
+    })
+}
+
+/// Edit an existing pull request's title and/or body.
+pub fn pr_edit(component_id: Option<&str>, options: PrEditOptions) -> Result<GithubPrOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    if options.title.is_none() && options.body.is_none() {
+        return Err(Error::validation_invalid_argument(
+            "title/body",
+            "At least one of --title or --body must be provided",
+            None,
+            None,
+        ));
+    }
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "edit".into(),
+        options.number.to_string(),
+        "-R".into(),
+        repo_flag,
+    ];
+    if let Some(title) = &options.title {
+        args.push("--title".into());
+        args.push(title.clone());
+    }
+    if let Some(body) = &options.body {
+        args.push("--body".into());
+        args.push(body.clone());
+    }
+
+    let output = run_gh(&args)?;
+    Ok(GithubPrOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "pr.edit".to_string(),
+        success: true,
+        number: Some(options.number),
+        url: Some(output.trim().to_string()),
+        title: options.title,
+        ..Default::default()
+    })
+}
+
+/// Find PRs matching the given filter.
+pub fn pr_find(component_id: Option<&str>, options: PrFindOptions) -> Result<GithubFindOutput> {
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let limit = if options.limit == 0 {
+        30
+    } else {
+        options.limit
+    };
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "list".into(),
+        "-R".into(),
+        repo_flag,
+        "--state".into(),
+        options.state.as_gh_flag().to_string(),
+        "--limit".into(),
+        limit.to_string(),
+        "--json".into(),
+        "number,title,url,state,baseRefName,headRefName".into(),
+    ];
+    if let Some(base) = &options.base {
+        args.push("--base".into());
+        args.push(base.clone());
+    }
+    if let Some(head) = &options.head {
+        args.push("--head".into());
+        args.push(head.clone());
+    }
+
+    let raw = run_gh(&args)?;
+    let items = parse_pr_list_json(&raw)?;
+
+    Ok(GithubFindOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "pr.find".to_string(),
+        success: true,
+        items,
+    })
+}
+
+/// Fetch metadata for one PR.
+pub fn pr_view(
+    component_id: Option<&str>,
+    number: u64,
+    path: Option<String>,
+) -> Result<GithubPrView> {
+    let (id, repo) = resolve_component_github(component_id, path.as_deref())?;
+    ensure_gh_ready()?;
+
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let args: Vec<String> = vec![
+        "pr".into(),
+        "view".into(),
+        number.to_string(),
+        "-R".into(),
+        repo_flag,
+        "--json".into(),
+        "author,baseRefName,headRefName,headRepository".into(),
+    ];
+    let raw = run_gh(&args)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        Error::internal_json(
+            format!("Failed to parse gh pr view JSON: {}", e),
+            Some(raw.clone()),
+        )
+    })?;
+    let author = parsed
+        .pointer("/author/login")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let base = parsed
+        .get("baseRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let head = parsed
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let head_repository = parsed
+        .pointer("/headRepository/nameWithOwner")
+        .or_else(|| parsed.pointer("/headRepository/name"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    Ok(GithubPrView {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        number,
+        author,
+        base,
+        head,
+        head_repository,
+    })
+}
+
+/// List changed files for one PR.
+pub fn pr_files(
+    component_id: Option<&str>,
+    number: u64,
+    path: Option<String>,
+) -> Result<Vec<String>> {
+    let (_id, repo) = resolve_component_github(component_id, path.as_deref())?;
+    ensure_gh_ready()?;
+    let args: Vec<String> = vec![
+        "api".into(),
+        "--paginate".into(),
+        format!("repos/{}/{}/pulls/{}/files", repo.owner, repo.repo, number),
+        "--jq".into(),
+        ".[].filename".into(),
+    ];
+    let raw = run_gh(&args)?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// Merge a PR with an explicit method.
+pub fn pr_merge(component_id: Option<&str>, options: PrMergeOptions) -> Result<GithubPrOutput> {
+    let method = validate_pr_merge_method(&options.method)?;
+    let (id, repo) = resolve_component_github(component_id, options.path.as_deref())?;
+    ensure_gh_ready()?;
+    let repo_flag = format!("{}/{}", repo.owner, repo.repo);
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        options.number.to_string(),
+        "-R".into(),
+        repo_flag,
+        format!("--{}", method),
+    ];
+    if options.delete_branch {
+        args.push("--delete-branch".into());
+    }
+    run_gh(&args)?;
+    Ok(GithubPrOutput {
+        component_id: id,
+        owner: repo.owner,
+        repo: repo.repo,
+        action: "pr.merge".to_string(),
+        success: true,
+        number: Some(options.number),
+        state: Some("merged".to_string()),
+        ..Default::default()
+    })
+}
+
+fn validate_pr_merge_method(method: &str) -> Result<String> {
+    match method {
+        "merge" | "squash" | "rebase" => Ok(method.to_string()),
+        other => Err(Error::validation_invalid_argument(
+            "merge_method",
+            format!("Unsupported merge method '{}'", other),
+            Some("Use merge, squash, or rebase".to_string()),
+            None,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a component ID to its GitHub owner/repo via `remote_url` (or git fallback).
+///
+/// `path_override` lets callers point at an unregistered checkout (e.g. a CI
+/// runner workspace with a portable `homeboy.json` but no global component
+/// registry entry). When set, the component is discovered from the portable
+/// config at that path instead of the global registry.
+pub(super) fn resolve_component_github(
+    component_id: Option<&str>,
+    path_override: Option<&str>,
+) -> Result<(String, GitHubRepo)> {
+    let (id, path) = resolve_target(component_id, path_override)?;
+    let comp = component::resolve_effective(Some(&id), path_override, None)?;
+
+    let remote_url = comp
+        .remote_url
+        .clone()
+        .or_else(|| detect_remote_url(Path::new(&path)))
+        .ok_or_else(|| {
+            Error::validation_invalid_argument(
+                "remote_url",
+                format!(
+                    "Component '{}' has no GitHub remote (remote_url not set and `git remote get-url origin` failed)",
+                    id
+                ),
+                None,
+                Some(vec![
+                    "Set it: homeboy component set <id> --json '{\"remote_url\":\"https://github.com/<owner>/<repo>\"}'".to_string(),
+                    "Or configure a git remote in the component's local_path".to_string(),
+                    "Or pass --path <workspace> to discover from a portable homeboy.json".to_string(),
+                ]),
+            )
+        })?;
+
+    let repo = parse_github_url(&remote_url).ok_or_else(|| {
+        Error::validation_invalid_argument(
+            "remote_url",
+            format!(
+                "Remote URL '{}' is not a GitHub URL (only github.com is supported)",
+                remote_url
+            ),
+            None,
+            Some(vec![
+                "Use an HTTPS (https://github.com/owner/repo) or SSH (git@github.com:owner/repo) URL".to_string(),
+            ]),
+        )
+    })?;
+
+    Ok((id, repo))
+}
+
+/// Run `gh <args>` swallowing stdout/stderr, return whether it exited successfully.
+/// Used for probe-style `gh` invocations that only care about the exit code
+/// (e.g. `gh --version`, `gh auth status`, `gh release view`).
+///
+/// Public so other modules can consolidate on one probe helper instead of
+/// reimplementing the same `Command::new + null stdio + status` pattern.
+pub fn gh_probe_succeeds(args: &[&str]) -> bool {
+    Command::new("gh")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Resolve a GitHub token for scripts that require `GH_TOKEN` explicitly.
+///
+/// Prefer the caller's environment, then fall back to the authenticated GitHub
+/// CLI token so extension scripts do not fail late after Homeboy has already
+/// verified that `gh` is usable.
+pub fn github_token_from_env_or_gh() -> Option<String> {
+    select_github_token(
+        std::env::var("GH_TOKEN").ok(),
+        std::env::var("GITHUB_TOKEN").ok(),
+        gh_auth_token,
+    )
+}
+
+fn select_github_token(
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    gh_auth_token: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    gh_token
+        .and_then(non_empty_token)
+        .or_else(|| github_token.and_then(non_empty_token))
+        .or_else(gh_auth_token)
+}
+
+fn non_empty_token(token: String) -> Option<String> {
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+fn gh_auth_token() -> Option<String> {
+    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    non_empty_token(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Error out if `gh` is missing or unauthenticated. Unlike `run_github_release`
+/// (which soft-fails because the tag is already pushed), primitive operations
+/// have no already-committed side effect to preserve — fail loudly.
+pub(super) fn ensure_gh_ready() -> Result<()> {
+    if !gh_probe_succeeds(&["--version"]) {
+        return Err(Error::internal_io(
+            "`gh` CLI not found on PATH".to_string(),
+            Some("gh".to_string()),
+        )
+        .with_hint("Install the GitHub CLI: https://cli.github.com"));
+    }
+
+    if !gh_probe_succeeds(&["auth", "status", "--hostname", "github.com"]) {
+        return Err(Error::internal_io(
+            "`gh` is not authenticated for github.com".to_string(),
+            Some("gh auth status".to_string()),
+        )
+        .with_hint("Authenticate with: gh auth login"));
+    }
+
+    Ok(())
+}
+
+/// Run `gh <args>` and return stdout on success, or a structured error on
+/// failure (with stderr captured in the error message).
+pub(super) fn run_gh(args: &[String]) -> Result<String> {
+    let output = Command::new("gh")
+        .args(args.iter().map(|s| s.as_str()))
+        .output()
+        .map_err(|e| {
+            Error::internal_io(format!("Failed to invoke gh: {}", e), Some("gh".into()))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let combined = if stderr.is_empty() { stdout } else { stderr };
+        return Err(Error::git_command_failed(format!(
+            "gh {} failed: {}",
+            args.first().map(|s| s.as_str()).unwrap_or(""),
+            combined
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_issue_number_from_url(url: &str) -> Option<u64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
+fn parse_issue_list_json(raw: &str, options: &IssueFindOptions) -> Result<Vec<GithubFindItem>> {
+    #[derive(serde::Deserialize)]
+    struct RawIssue {
+        number: u64,
+        title: String,
+        #[serde(default)]
+        body: Option<String>,
+        url: String,
+        state: String,
+        #[serde(default, rename = "stateReason")]
+        state_reason: Option<String>,
+        #[serde(default, rename = "closedAt")]
+        closed_at: Option<String>,
+        #[serde(default)]
+        labels: Vec<RawLabel>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawLabel {
+        name: String,
+    }
+
+    let parsed: Vec<RawIssue> = serde_json::from_str(raw.trim())
+        .map_err(|e| Error::internal_json(e.to_string(), Some("gh issue list".into())))?;
+
+    let out = parsed
+        .into_iter()
+        .filter(|i| match &options.title {
+            Some(t) => &i.title == t,
+            None => true,
+        })
+        .filter(|i| {
+            options
+                .labels
+                .iter()
+                .all(|needle| i.labels.iter().any(|l| &l.name == needle))
+        })
+        .map(|i| GithubFindItem {
+            number: i.number,
+            title: i.title,
+            body: i.body.unwrap_or_default(),
+            url: i.url,
+            state: i.state,
+            state_reason: i.state_reason.unwrap_or_default(),
+            closed_at: i.closed_at.unwrap_or_default(),
+            labels: i.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect();
+    Ok(out)
+}
+
+fn parse_pr_list_json(raw: &str) -> Result<Vec<GithubFindItem>> {
+    #[derive(serde::Deserialize)]
+    struct RawPr {
+        number: u64,
+        title: String,
+        url: String,
+        state: String,
+    }
+
+    let parsed: Vec<RawPr> = serde_json::from_str(raw.trim())
+        .map_err(|e| Error::internal_json(e.to_string(), Some("gh pr list".into())))?;
+    Ok(parsed
+        .into_iter()
+        .map(|p| GithubFindItem {
+            number: p.number,
+            title: p.title,
+            body: String::new(),
+            url: p.url,
+            state: p.state,
+            state_reason: String::new(),
+            closed_at: String::new(),
+            labels: Vec::new(),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure parsing helpers (no gh shelling)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_token_prefers_gh_token_env() {
+        let token = select_github_token(
+            Some(" env-gh-token \n".to_string()),
+            Some("github-token".to_string()),
+            || Some("cli-token".to_string()),
+        );
+
+        assert_eq!(token.as_deref(), Some("env-gh-token"));
+    }
+
+    #[test]
+    fn github_token_falls_back_to_github_token_env() {
+        let token = select_github_token(
+            Some("  ".to_string()),
+            Some("github-token".to_string()),
+            || Some("cli-token".to_string()),
+        );
+
+        assert_eq!(token.as_deref(), Some("github-token"));
+    }
+
+    #[test]
+    fn github_token_falls_back_to_gh_auth_token() {
+        let token = select_github_token(None, None, || Some("cli-token".to_string()));
+
+        assert_eq!(token.as_deref(), Some("cli-token"));
+    }
+
+    #[test]
+    fn parse_issue_number_from_issue_url() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/owner/repo/issues/42"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_issue_number_from_pr_url() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/owner/repo/pull/1337"),
+            Some(1337)
+        );
+    }
+
+    #[test]
+    fn parse_issue_number_handles_trailing_slash() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/owner/repo/issues/42/"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_issue_number_none_for_non_numeric() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/owner/repo/issues/not-a-number"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_issue_list_filters_by_title() {
+        let raw = r#"[
+            {"number":1,"title":"bug: one","url":"u1","state":"open","labels":[]},
+            {"number":2,"title":"bug: two","url":"u2","state":"open","labels":[]}
+        ]"#;
+        let opts = IssueFindOptions {
+            title: Some("bug: two".into()),
+            ..Default::default()
+        };
+        let items = parse_issue_list_json(raw, &opts).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 2);
+    }
+
+    #[test]
+    fn parse_issue_list_requires_all_labels() {
+        let raw = r#"[
+            {"number":1,"title":"a","url":"u1","state":"open","labels":[{"name":"ci-failure"}]},
+            {"number":2,"title":"b","url":"u2","state":"open","labels":[{"name":"ci-failure"},{"name":"autofix"}]}
+        ]"#;
+        let opts = IssueFindOptions {
+            labels: vec!["ci-failure".into(), "autofix".into()],
+            ..Default::default()
+        };
+        let items = parse_issue_list_json(raw, &opts).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 2);
+    }
+
+    #[test]
+    fn parse_pr_list_extracts_all_entries() {
+        let raw = r#"[
+            {"number":10,"title":"feat: x","url":"u10","state":"OPEN"},
+            {"number":11,"title":"chore: y","url":"u11","state":"OPEN"}
+        ]"#;
+        let items = parse_pr_list_json(raw).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, 10);
+        assert_eq!(items[1].state, "OPEN");
+    }
+
+    #[test]
+    fn test_pr_files() {
+        let owner = "Extra-Chill";
+        let repo = "homeboy";
+        let number = 42_u64;
+        assert_eq!(
+            format!("repos/{}/{}/pulls/{}/files", owner, repo, number),
+            "repos/Extra-Chill/homeboy/pulls/42/files"
+        );
+    }
+
+    #[test]
+    fn test_pr_view() {
+        let raw = r#"{
+            "author":{"login":"homeboy-ci[bot]"},
+            "baseRefName":"main",
+            "headRefName":"ci/autofix/homeboy/main",
+            "headRepository":{"nameWithOwner":"Extra-Chill/homeboy"}
+        }"#;
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.pointer("/author/login").and_then(|v| v.as_str()),
+            Some("homeboy-ci[bot]")
+        );
+        assert_eq!(
+            parsed.get("baseRefName").and_then(|v| v.as_str()),
+            Some("main")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/headRepository/nameWithOwner")
+                .and_then(|v| v.as_str()),
+            Some("Extra-Chill/homeboy")
+        );
+    }
+
+    #[test]
+    fn test_pr_merge() {
+        let result = pr_merge(
+            Some("missing-component"),
+            PrMergeOptions {
+                method: "explode".into(),
+                number: 1,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn issue_state_gh_flag() {
+        assert_eq!(IssueState::Open.as_gh_flag(), "open");
+        assert_eq!(IssueState::Closed.as_gh_flag(), "closed");
+        assert_eq!(IssueState::All.as_gh_flag(), "all");
+    }
+
+    #[test]
+    fn pr_state_gh_flag() {
+        assert_eq!(PrState::Open.as_gh_flag(), "open");
+        assert_eq!(PrState::Merged.as_gh_flag(), "merged");
+    }
+
+    #[test]
+    fn issue_close_reason_gh_flag() {
+        assert_eq!(IssueCloseReason::Completed.as_gh_flag(), "completed");
+        assert_eq!(IssueCloseReason::NotPlanned.as_gh_flag(), "not planned");
+    }
+
+    #[test]
+    fn parse_issue_list_extracts_state_reason_and_closed_at() {
+        // gh issue list --json includes stateReason + closedAt fields when
+        // requested. Closed-completed, closed-not_planned, and open issues
+        // are represented in this fixture.
+        let raw = r#"[
+            {
+                "number": 100,
+                "title": "audit: thing in repo (3)",
+                "url": "https://github.com/o/r/issues/100",
+                "state": "OPEN",
+                "stateReason": null,
+                "closedAt": null,
+                "labels": [{"name":"audit"}]
+            },
+            {
+                "number": 101,
+                "title": "audit: other in repo (5)",
+                "url": "https://github.com/o/r/issues/101",
+                "state": "CLOSED",
+                "stateReason": "completed",
+                "closedAt": "2026-04-25T12:00:00Z",
+                "labels": [{"name":"audit"}]
+            },
+            {
+                "number": 102,
+                "title": "audit: muted in repo (12)",
+                "url": "https://github.com/o/r/issues/102",
+                "state": "CLOSED",
+                "stateReason": "not_planned",
+                "closedAt": "2026-04-26T03:00:00Z",
+                "labels": [{"name":"audit"},{"name":"wontfix"}]
+            }
+        ]"#;
+        let opts = IssueFindOptions {
+            state: IssueState::All,
+            ..Default::default()
+        };
+        let items = parse_issue_list_json(raw, &opts).unwrap();
+        assert_eq!(items.len(), 3);
+
+        // Open issue: empty state_reason and closed_at, single label.
+        assert_eq!(items[0].number, 100);
+        assert_eq!(items[0].state, "OPEN");
+        assert_eq!(items[0].state_reason, "");
+        assert_eq!(items[0].closed_at, "");
+        assert_eq!(items[0].labels, vec!["audit".to_string()]);
+
+        // Closed completed: state_reason populated, closed_at populated.
+        assert_eq!(items[1].number, 101);
+        assert_eq!(items[1].state, "CLOSED");
+        assert_eq!(items[1].state_reason, "completed");
+        assert_eq!(items[1].closed_at, "2026-04-25T12:00:00Z");
+
+        // Closed not_planned with suppression label.
+        assert_eq!(items[2].number, 102);
+        assert_eq!(items[2].state_reason, "not_planned");
+        assert_eq!(
+            items[2].labels,
+            vec!["audit".to_string(), "wontfix".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_issue_list_handles_missing_optional_fields() {
+        // Older gh versions or projects without state-reason support emit
+        // payloads without those fields. Default-deserialize to empty.
+        let raw = r#"[
+            {"number":1,"title":"x","url":"u","state":"open","labels":[]}
+        ]"#;
+        let opts = IssueFindOptions::default();
+        let items = parse_issue_list_json(raw, &opts).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state_reason, "");
+        assert_eq!(items[0].closed_at, "");
+        assert!(items[0].labels.is_empty());
+    }
+}

@@ -4,6 +4,28 @@ All notable changes to Homeboy CLI are documented in this file.
 
 (This file is embedded into the CLI binary and is also viewable via `homeboy changelog`.)
 
+## [0.228.0] - 2026-06-09
+
+### Added
+- added new feature
+
+### Changed
+- added edge-case tests
+- configuration
+- bumped dependencies
+- updated workflow
+- user tests
+- reduced allocations
+- extracted helper
+- main logic
+- formatting changes
+- initial commit
+
+### Fixed
+- model
+- type errors
+- resolved bug in model
+
 ## [0.227.3] - 2026-06-09
 
 ### Changed
